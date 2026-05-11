@@ -1,0 +1,4 @@
+[default_config]
+# Configure documentation available for features like hover and completions
+assembler = "fasm"
+instruction_set = "x86/x86-64"
