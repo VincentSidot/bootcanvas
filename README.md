@@ -14,32 +14,35 @@ assembly stages plus a converted `640x480`, 16-color image payload.
 ## Build and Run
 
 ```sh
-./utils/build.sh
-./utils/run.sh
+make build
+make run
 ```
 
 Generated files are written to `build/`.
 
-If `fasm` is not available locally, the build falls back to the Docker wrapper
-in `utils/fasm.sh`, which builds the local image from `docker/Dockerfile` on
+Use `make python-setup` to create the local virtualenv and install Python
+dependencies ahead of time. The build also invokes that setup path as needed.
+
+`utils/fasm.sh` is the FASM entrypoint. It uses native `fasm` when available
+and otherwise falls back to the Docker image built from `docker/Dockerfile` on
 first use.
 
-`make build` and `make run` are still available as thin wrappers around those
-scripts.
+`utils/build.sh` and `utils/run.sh` remain as compatibility wrappers around the
+Make targets.
 
 ## Change the Target Image
 
 Put your image in the project, then pass it with `IMAGE_SRC`:
 
 ```sh
-IMAGE_SRC=./image/my-picture.jpg ./utils/build.sh
+IMAGE_SRC=./image/my-picture.jpg make build
 ```
 
 Then rebuild:
 
 ```sh
 make clean
-IMAGE_SRC=./image/my-picture.jpg ./utils/build.sh
+IMAGE_SRC=./image/my-picture.jpg make build
 ```
 
 The converter resizes the image to `640x480` and reduces it to 16 colors before

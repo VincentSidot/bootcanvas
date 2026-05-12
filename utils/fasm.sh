@@ -2,10 +2,15 @@
 
 set -euo pipefail
 
-host_root="$(pwd)"
+if command -v fasm >/dev/null 2>&1; then
+    exec fasm "$@"
+fi
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+host_root="$root_dir"
 container_root="/work"
 image_name="bootcanvas-fasm:local"
-dockerfile_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../docker" && pwd)"
+dockerfile_dir="$root_dir/docker"
 args=()
 
 # Translate host paths to container paths for arguments that are within the host
