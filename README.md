@@ -7,32 +7,39 @@ assembly stages plus a converted `640x480`, 16-color image payload.
 
 ## Requirements
 
-- `fasm`
+- `python3`
 - `qemu-system-i386`
-- `uv`
+- `fasm` or Docker
 
 ## Build and Run
 
 ```sh
-make build
-make run
+./utils/build.sh
+./utils/run.sh
 ```
 
 Generated files are written to `build/`.
 
+If `fasm` is not available locally, the build falls back to the Docker wrapper
+in `utils/fasm.sh`, which builds the local image from `docker/Dockerfile` on
+first use.
+
+`make build` and `make run` are still available as thin wrappers around those
+scripts.
+
 ## Change the Target Image
 
-Put your image in the project, then update `IMAGE_SRC` in `Makefile`:
+Put your image in the project, then pass it with `IMAGE_SRC`:
 
-```make
-IMAGE_SRC := image/my-picture.jpg
+```sh
+IMAGE_SRC=./image/my-picture.jpg ./utils/build.sh
 ```
 
 Then rebuild:
 
 ```sh
 make clean
-make build
+IMAGE_SRC=./image/my-picture.jpg ./utils/build.sh
 ```
 
 The converter resizes the image to `640x480` and reduces it to 16 colors before
