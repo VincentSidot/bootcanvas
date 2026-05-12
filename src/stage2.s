@@ -10,13 +10,6 @@ macro VGA_SET_MODE mode {
   int 0x10
 }
 
-macro OUTB mode, value {
-  mov dx, mode
-  mov al, value
-  out dx, al
-}
-
-
 VGA_MODE_640x480_16_COLOR = 0x12
 VGA_FRAMEBUFFER_SEGMENT = 0xA000
 VGA_GRAPHICS_DATA  = 0x03CF
@@ -25,36 +18,47 @@ VGA_SEQUENCER_DATA = 0x03C5
 VGA_SEQUENCER_INDEX = 0x03C4
 
 start:
+  cld ; Clear the direction flag to ensure we copy forward
   VGA_SET_MODE VGA_MODE_640x480_16_COLOR
 
-  SCREEN_WIDTH = 640
-  SCREEN_HEIGHT = 480
-  SCREEN_SIZE = (SCREEN_WIDTH * SCREEN_HEIGHT) / 8 ; Each byte represents
-  SCREEN_WIDTH_BYTES = SCREEN_WIDTH / 8 ; Number of bytes per line
-
-  VGA_GREEN = 0x02
-  VGA_RED = 0x04
-
-  call getsize ; Get the image size from the image header
+  call read_rle_mode ; Read the RLE planes status
   call init_attr_palette ; Initialize the VGA palette to a known state
-  call palette ; Set the VGA palette to match the image palette
+  call load_palette ; Set the VGA palette to match the image palette
 
-  call display_image ; Display the image on the screen
+  ; Fill ds:si with the start of the image data
+  mov ax, IMAGE_LOAD_SEGMENT
+  mov ds, ax
+  ; Start of the image data (after header and palette)
+  mov si, IMAGE_LOAD_OFFSET + IMAGE_MAGIC_SIZE + 1 + 16 * 3
 
-  jmp halt
+  call setup_vga_direct_write ; Setup VGA registers for direct writes to the framebuffer
+
+  xor bx, bx ; bl = plane index (0-3)
+.plane_loop:
+  mov dl, bl
+  call display_plane ; Display the current plane
+
+  inc bl
+  cmp bl, 4 ; We have 4 planes to display
+  jb .plane_loop
 
 halt:
   hlt
   jmp halt
 
-getsize:
+
+read_rle_mode:
+  push ax
+  push es
+
   mov ax, IMAGE_LOAD_SEGMENT
   mov es, ax
-  mov ax, word [es:IMAGE_LOAD_OFFSET] ; Load the image header
-  add ax, IMAGE_LOAD_OFFSET
-  ; Store the end address of the image for later use
-  mov word [end_image], ax
-  ret
+  mov al, byte [es:IMAGE_LOAD_OFFSET + IMAGE_MAGIC_SIZE] ; Load the image header
+  mov [rle_plane_mode], al ; Store the RLE mode for later use
+
+  pop es
+  pop ax
+ret
 
 init_attr_palette:
   xor bl, bl
@@ -67,14 +71,13 @@ init_attr_palette:
   inc bl
   cmp bl, 16
   jb .loop
-
 ret
 
-palette:
+load_palette:
   ; Set the palette to match the image palette.
   mov ax, IMAGE_LOAD_SEGMENT
   mov es, ax
-  mov si, IMAGE_LOAD_OFFSET + 2; Start of the palette data
+  mov si, IMAGE_LOAD_OFFSET + IMAGE_MAGIC_SIZE + 1; Start of the palette data
   xor bx, bx ; Start at the first palette entry
   .loop:
   mov dh, byte [es:si] ; Red
@@ -94,130 +97,160 @@ palette:
   inc bx ; Move to the next palette entry
   cmp bx, 16 ; We have 16 palette entries in mode 0x12
   jb .loop
-
 ret
 
-display_image:
- ; Read pixel from image data.
- ; Image pixels are compressed by RLE (4bit rep, 4bit index)
- mov ax, IMAGE_LOAD_SEGMENT
- mov ds, ax
- mov si, IMAGE_LOAD_OFFSET + 2 + 16 * 3; Start of the palette data
+display_plane:
+  ; Display a single plane from the image data.
+  ; input:
+  ;   dl = plane number (0-3)
+  ;   ds:si = pointer to the start of the plane data
+  ; stores:
+  ;   es:di = pointer to the start of the framebuffer for this plane
 
- mov cx, 0; X coordinate
- mov dx, 0; Y coordinate
-
- mov ds, ax ; Set DS to 0
-
- .loop:
- cmp si, word [cs:end_image] ; Check if we've reached the end of the image data
- jae .done
- lodsb
-
- ; AL = [rep(4bit) | index(4bit)]
- ; We need to write 'rep' pixels of color 'index' to the screen
- mov bl, al
- shr bl, 4    ; Get the rep count (number of pixels to write)
- and al, 0x0F ; Get the color index (0-15)
-
- .rep_loop:
-  call set_pixel ; Set the pixel at (cx, dx) to color index in AL
-  inc cx
-  cmp cx, SCREEN_WIDTH
-  jne .continue
-  ; Move to the next line
-  inc dx
-  xor cx, cx ; Reset x to 0
-  .continue:
-  dec bl
-  jnz .rep_loop
-
-  ; Loop back to read the next pixel data
-  jmp .loop
- .done:
-  ret
-
-set_pixel:
+  ; Stack allocation indexes:
   push ax
   push bx
   push cx
   push dx
-  push si
-  push di
-  ; Input: AL = color index (0-15), CX = x, DX = y
-  ; Calculate the byte offset in the framebuffer
-  ; Framebuffer layout: 4 planes, 8pixels per byte
-  ; Byte offset = (y * SCREEN_WIDTH_BYTES) + (x / 8)
-  push ax ; Save the color index
-  mov ax, dx ; y
-  mov dx, SCREEN_WIDTH_BYTES
-  mul dx ; ax = y * SCREEN_WIDTH_BYTES
-  mov si, cx ; save x
-  shr si, 3 ; x / 8
-  add si, ax ; si = (y * SCREEN_WIDTH_BYTES) + (x / 8)
+  push bp
 
+  mov bp, sp ; Set BP to the current stack pointer
 
-  mov dx, VGA_SEQUENCER_INDEX
-  mov al, 0x02 ; Select plane mask register (0x02)
-  out dx, al
+  PLANE_INDEX_OFFSET = -1 ; Offset for the plane number (dl)
+  PLANE_SIZE_OFFSET = -3 ; Offset for the plane size (word)
+  STACK_ALLOC_SIZE = 4
+  sub sp, STACK_ALLOC_SIZE ; Allocate space on the stack for local variables
+
+  mov byte [bp + PLANE_INDEX_OFFSET], dl ; Store the plane number on the stack
+
+  ; read the plane size
+  lodsw ; ax = [ds:si], si += 2
+  mov word [bp + PLANE_SIZE_OFFSET], ax ; Store the plane size on the stack
 
   mov dx, VGA_FRAMEBUFFER_SEGMENT
   mov es, dx
+  xor di, di
+
+  ; Check if RLE is enabled for this plane
+  mov bh, [cs:rle_plane_mode]
+  mov bl, 1 ; Get the plane index
+  mov cl, byte [bp + PLANE_INDEX_OFFSET]
+  shl bl, cl ; bl = 1 << plane_index
+
+  ; Set the plane mask to select the current plane
+  mov al, bl
+  call set_vga_plane_mask
+
+  mov cx, word [bp + PLANE_SIZE_OFFSET] ; Get the plane size
+  test bh, bl ; Check if RLE is enabled for this plane.
+  jz .display_uncompressed
+  ; RLE is enabled for this plane, we need to decode it
+  ; [COUNT][BYTE] pairs
+  ; Copy the decoded data to the framebuffer
+.display_rle:
+  cmp cx, 0
+  je .done
+
+  cmp si, 0xF000
+  jb .rle_read_count
+  call normalize_ds_si
+
+.rle_read_count:
+  lodsb ; Load the count byte into al
+  dec cx
+  mov bl, al
+.rle_read_value:
+  lodsb
+  dec cx
+.rle_write_loop:
+  ; Write 'count' bytes of 'value' to the framebuffer
+  stosb ; Store byte from al to [es:di] and
+  dec bl
+  jnz .rle_write_loop ; If count is not zero, write the next byte
+  jmp .display_rle
+.display_uncompressed:
+  ; Copy the plane data to the framebuffer
+  cmp cx, 0
+  je .done
+  movsb ; Copy byte from [ds:si] to [es:di]
+  dec cx
+
+  cmp si, 0xF000; Align every 24575 bytes
+  jb .display_uncompressed
+  ; Normalize DS:SI to avoid crossing segment boundaries
+  call normalize_ds_si
+  jmp .display_uncompressed
 
 
-  pop bx ; Restore the color index to AL
+.done:
+  add sp, STACK_ALLOC_SIZE ; Clean up the stack
 
-  ; Compute the pixel index within the byte (0-7)
-  ; Pixel index = x % 8
-  and cl, 7 ; cl = x % 8
-  ; Create a bitmask for the pixel index
-  mov ah, 0x80
-  shr ah, cl ; ch = 0x80 >> (x % 8) = reversed
-  mov bh, ah
-  not bh ; Invert the bitmask to clear the pixel
-
-  mov cl, 0 ; We have 4 planes to write to
-  .loop:
-
-  mov dx, VGA_GRAPHICS_INDEX
-  mov al, 0x04
-  out dx, al
-
-  mov dx, VGA_GRAPHICS_DATA
-  mov al, cl                 ; read plane = current plane
-  out dx, al
-
-  mov dx, VGA_SEQUENCER_DATA
-  mov al, 1
-  shl al, cl ; Select the plane
-  out dx, al ; Set the plane mask to select the current plane
-
-  mov dh, byte [es:si] ; Get the color bit for the current plane
-
-  test al, bl ; Check
-  jz .clear_bit
-  .set_bit:
-  or dh, ah
-  jmp .write
-  .clear_bit:
-  and dh, bh ; Clear the bit
-  .write:
-  mov byte [es:si], dh
-  inc cl
-  cmp cl, 4 ; We have 4 planes to write to
-  jb .loop
-
-  pop di
-  pop si
+  pop bp
   pop dx
   pop cx
   pop bx
   pop ax
+ret
 
-  ret
+set_vga_plane_mask:
+ ; input: AL = map
+ push ax
+ push dx
 
+ mov ah, al
 
-end_image: dw 0 ; End address of the image
+ mov dx, VGA_SEQUENCER_INDEX
+ mov al, 0x02
+ out dx, al
+
+ inc dx
+ mov al, ah
+ out dx, al
+
+ pop dx
+ pop ax
+ret
+
+setup_vga_direct_write:
+  push ax
+  push dx
+
+  ; Graphics Controller: Set/Reset = 0
+  mov dx, VGA_GRAPHICS_INDEX
+  mov al, 0x00
+  out dx, al
+  inc dx
+  xor al, al
+  out dx, al
+
+  ; Graphics Controller: Read Map Select = 0
+  mov dx, VGA_GRAPHICS_INDEX
+  mov al, 0x04
+  out dx, al
+  inc dx
+  xor al, al
+  out dx, al
+
+  pop dx
+  pop ax
+ret
+
+normalize_ds_si:
+  push ax
+  push bx
+
+  mov bx, si
+  shr bx, 4 ; Get the segment (si / 16)
+  mov ax, ds
+  add ax, bx
+  mov ds, ax
+  and si, 0x0F ; Get the offset (si % 16)
+
+  pop bx
+  pop ax
+ret
+
+rle_plane_mode: db 0; RLE enabled per plane (bit 0 = plane 0, bit 1 = plane 1, etc.)
 
 ; Pad to closest 512-byte sector boundary
 DATA_SIZE = ($ - $$)
