@@ -41,7 +41,7 @@ def dump_palette(img, output_file):
 
 
 def dump_pixels(img, output_file):
-    pixels = img.get_flattened_data()
+    pixels = img.getdata()
 
     # Encode pixels as 4 bits per pixel (16 colors)
     # Use simple RLE encoding: if the next pixel is the same as the current one,
@@ -85,7 +85,7 @@ def encode(input: str, output: str):
     img = img.resize(TARGET_SIZE)
 
     # Convert the image to 16 colors
-    img = img.convert("P", palette=Image.ADAPTIVE, colors=16)
+    img = img.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
 
     payload = io.BytesIO()
 
